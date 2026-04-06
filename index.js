@@ -1,146 +1,153 @@
 const express = require('express');
-const WebSocket = require('ws');
-const net = require('net');
-const tls = require('tls');
 const https = require('https');
-const { URL } = require('url');
-
+const WebSocket = require('ws');
 const app = express();
 const PORT = process.env.PORT || 3000;
-const GAME_WS_URL = process.env.GAME_WS_URL || 'wss://connect.gloryclub.in';
-const TOKEN = process.env.GAME_TOKEN || 'c89a6fd48bc0488cbfe9fc4479de7f9ea685c3c0cac04984a74dfd2620cb529c';
-const PROXY_URL = process.env.PROXY_URL || '';
+
+// Config
+const API_URL = 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web';
+const WS_URL = 'wss://wtxmd52.tele68.com/txmd5/?EIO=4&transport=websocket';
+const AT = process.env.AT_TOKEN || '5848a1b6c31c549ee87fa61fd1b3f3f6';
+const POLL_INTERVAL = 20000;
 
 let sessions = [];
-let currentSession = null;
+let lastId = 0;
+let pollCount = 0;
+let lastPoll = null;
 let wsClient = null;
-let reconnectTimer = null;
+let currentBetData = null; // tiền cược real-time
 
-// Proxy agent kế thừa https.Agent (wss cần https)
-class ProxyAgent extends https.Agent {
-  constructor(proxyUrl) {
-    super({ rejectUnauthorized: false });
-    this.proxy = new URL(proxyUrl);
-  }
-  createConnection(opts, cb) {
-    const sock = net.connect(parseInt(this.proxy.port), this.proxy.hostname, () => {
-      const auth = this.proxy.username
-        ? Buffer.from(`${decodeURIComponent(this.proxy.username)}:${decodeURIComponent(this.proxy.password)}`).toString('base64')
-        : null;
-      let req = `CONNECT ${opts.host}:${opts.port||443} HTTP/1.1\r\nHost: ${opts.host}:${opts.port||443}\r\n`;
-      if (auth) req += `Proxy-Authorization: Basic ${auth}\r\n`;
-      req += '\r\n';
-      sock.write(req);
-      sock.once('data', (d) => {
-        if (d.toString().includes('200')) {
-          const tlsSock = tls.connect({ socket: sock, servername: opts.host, rejectUnauthorized: false }, () => cb(null, tlsSock));
-          tlsSock.on('error', cb);
-        } else {
-          cb(new Error('Proxy CONNECT failed: ' + d.toString().split('\r\n')[0]));
-        }
-      });
-    });
-    sock.on('error', cb);
-    return sock;
-  }
+// ===== HTTP POLL (lịch sử) =====
+function fetchSessions() {
+  return new Promise((resolve, reject) => {
+    https.get(`${API_URL}&at=${AT}`, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+    }).on('error', reject);
+  });
 }
 
-// Packets
-function buildHandshake() {
-  const body = JSON.stringify({ sys: { platform: 'js-websocket', clientBuildNumber: '0.0.1', clientVersion: '0a21481d746f92f8428e1b6deeb76fea' } });
-  const buf = Buffer.alloc(4 + body.length);
-  buf[0]=0x01; buf[1]=0x00; buf[2]=0x00; buf[3]=body.length;
-  Buffer.from(body).copy(buf, 4);
-  return buf;
-}
-function buildHeartbeat() { return Buffer.from([0x02,0x00,0x00,0x00]); }
-function buildLogin(token) {
-  return Buffer.concat([Buffer.from([0x04,0x00,0x00,0x4d,0x01,0x01,0x00,0x01,0x08,0x02,0x10,0xca,0x01,0x1a,0x40]), Buffer.from(token,'ascii'), Buffer.from([0x42,0x00])]);
-}
-function buildGetGameList() { return Buffer.from('0400001c0002196c6f6262792e6163636f756e742e67657467616d656c697374','hex'); }
-
-function decodeVarint(buf, offset) {
-  let val=0, shift=0;
-  while(offset<buf.length){const b=buf[offset++];val|=(b&0x7f)<<shift;shift+=7;if(!(b&0x80))break;}
-  return {val,offset};
-}
-
-function processMessage(data) {
-  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const text = buf.toString('utf8');
-  if (text.includes('mnmdsbgamestart')) {
-    const hashMatch = text.match(/[0-9a-f]{32}/);
-    const mi = text.indexOf('mnmdsbgamestart');
-    const after = buf.slice(mi+'mnmdsbgamestart'.length);
-    let session = null;
-    if (after[0]===0x08){const r=decodeVarint(after,1);session=Math.round(r.val/2);}
-    currentSession = {session, hash: hashMatch?hashMatch[0]:null};
-    console.log(`🎲 Phiên #${session}`);
-    return;
-  }
-  if (text.includes('mnmdsbgameend')) {
-    const m = text.match(/\{(\d+)-(\d+)-(\d+)\}/);
-    if (!m) return;
-    const d1=+m[1],d2=+m[2],d3=+m[3],total=d1+d2+d3;
-    const s = currentSession||{};
-    const record = {Phien:s.session,Hash:s.hash,Xuc_xac_1:d1,Xuc_xac_2:d2,Xuc_xac_3:d3,Tong:total,Ket_qua:total>=11?'Tài':'Xỉu',time:new Date().toISOString()};
-    if (!sessions.find(x=>x.Phien===record.Phien)) {
+async function poll() {
+  try {
+    const data = await fetchSessions();
+    if (!data.list) return;
+    let newCount = 0;
+    for (const item of data.list) {
+      if (item.id <= lastId) continue;
+      if (sessions.find(s => s.Phien === item.id)) continue;
+      const record = {
+        Phien: item.id, Hash: item._id,
+        Xuc_xac_1: item.dices[0], Xuc_xac_2: item.dices[1], Xuc_xac_3: item.dices[2],
+        Tong: item.point, Ket_qua: item.resultTruyenThong === 'TAI' ? 'Tài' : 'Xỉu',
+        time: new Date().toISOString()
+      };
       sessions.unshift(record);
-      if (sessions.length>500) sessions=sessions.slice(0,500);
-      console.log(`✅ #${s.session} | ${d1}-${d2}-${d3} = ${total} → ${record.Ket_qua}`);
+      newCount++;
+      console.log(`✅ #${record.Phien} | ${record.Xuc_xac_1}-${record.Xuc_xac_2}-${record.Xuc_xac_3} = ${record.Tong} → ${record.Ket_qua}`);
     }
-    currentSession = null;
-  }
+    if (data.list.length > 0) lastId = Math.max(lastId, ...data.list.map(i => i.id));
+    if (sessions.length > 500) sessions = sessions.slice(0, 500);
+    pollCount++; lastPoll = new Date().toISOString();
+  } catch(e) { console.error('❌ Poll error:', e.message); }
 }
 
+// ===== SOCKET.IO WS (tiền cược real-time) =====
 function connectWS() {
-  if (wsClient && wsClient.readyState===WebSocket.OPEN) return;
-  console.log(`🔌 Connecting... proxy=${PROXY_URL?'YES':'NO'}`);
-  const opts = {
-    headers: {'Origin':'https://68gbvn88.bar','User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36','Cache-Control':'no-cache','Pragma':'no-cache'},
+  if (wsClient && wsClient.readyState === WebSocket.OPEN) return;
+  console.log('🔌 Connecting WS...');
+
+  wsClient = new WebSocket(WS_URL, {
+    headers: { 'Origin': 'https://wtxmd52.tele68.com' },
     rejectUnauthorized: false
-  };
-  if (PROXY_URL) opts.agent = new ProxyAgent(PROXY_URL);
-  wsClient = new WebSocket(GAME_WS_URL, opts);
-  let hb = null;
+  });
+
   wsClient.on('open', () => {
-    console.log('✅ Connected!');
-    wsClient.send(buildHandshake());
-    setTimeout(()=>wsClient.send(buildHeartbeat()),500);
-    setTimeout(()=>wsClient.send(buildLogin(TOKEN)),1000);
-    setTimeout(()=>wsClient.send(buildGetGameList()),2000);
-    hb = setInterval(()=>{if(wsClient.readyState===WebSocket.OPEN)wsClient.send(buildHeartbeat());},25000);
+    console.log('✅ WS connected!');
+    // Socket.IO handshake
+    wsClient.send('40/txmd5,');
   });
-  wsClient.on('message',(data)=>{try{processMessage(data);}catch(e){}});
-  wsClient.on('close',(code)=>{
-    console.log(`🔴 Closed: ${code}`);
-    if(hb)clearInterval(hb);
-    clearTimeout(reconnectTimer);
-    reconnectTimer=setTimeout(connectWS,5000);
+
+  wsClient.on('message', (data) => {
+    try {
+      const msg = data.toString();
+      // Socket.IO format: 42/txmd5,["event", payload]
+      const match = msg.match(/^42\/txmd5,(\[.+\])$/);
+      if (!match) return;
+      const arr = JSON.parse(match[1]);
+      const evt = arr[0], payload = arr[1];
+
+      if (evt === 'tick-update' && payload?.data) {
+        currentBetData = {
+          sessionId: payload.id,
+          state: payload.state,
+          totalUsers: payload.data.totalUniqueUsers,
+          totalAmount: payload.data.totalAmount,
+          taiUsers: payload.data.totalUsersPerType?.TAI || 0,
+          xiuUsers: payload.data.totalUsersPerType?.XIU || 0,
+          taiAmount: payload.data.totalAmountPerType?.TAI || 0,
+          xiuAmount: payload.data.totalAmountPerType?.XIU || 0,
+          updatedAt: new Date().toISOString()
+        };
+      }
+
+      if (evt === 'session-result' || evt === 'result') {
+        console.log('🎲 WS Result:', JSON.stringify(payload));
+        poll(); // Trigger poll ngay khi có kết quả
+      }
+    } catch(e) {}
   });
-  wsClient.on('error',(e)=>console.error('⚠️',e.message));
+
+  wsClient.on('close', (code) => {
+    console.log(`🔴 WS closed: ${code} - retry in 5s`);
+    setTimeout(connectWS, 5000);
+  });
+
+  wsClient.on('error', (e) => console.error('⚠️ WS:', e.message));
+
+  // Socket.IO ping mỗi 25s
+  setInterval(() => {
+    if (wsClient && wsClient.readyState === WebSocket.OPEN) wsClient.send('2');
+  }, 25000);
 }
 
-app.use(express.json());
-app.use((req,res,next)=>{
-  res.header('Access-Control-Allow-Origin','*');
-  res.header('Access-Control-Allow-Headers','Content-Type');
-  if(req.method==='OPTIONS')return res.sendStatus(200);
+// ===== API =====
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
   next();
 });
-app.get('/api/myip', async (req, res) => {
-  try {
-    const r = await new Promise((resolve, reject) => {
-      https.get('https://api.ipify.org?format=json', (resp) => {
-        let d = '';
-        resp.on('data', c => d += c);
-        resp.on('end', () => resolve(JSON.parse(d)));
-      }).on('error', reject);
-    });
-    res.json(r);
-  } catch(e) { res.json({error: e.message}); }
+
+app.get('/api/lichsu', (req, res) => {
+  const limit = parseInt(req.query.limit) || 200;
+  const data = sessions.slice(0, limit);
+  // Gắn bet data vào phiên hiện tại nếu có
+  if (currentBetData && data.length > 0) {
+    data[0]._betData = currentBetData;
+  }
+  res.json(data);
 });
-app.get('/api/lichsu',(req,res)=>res.json(sessions.slice(0,parseInt(req.query.limit)||200)));
-app.get('/api/status',(req,res)=>res.json({ws:wsClient?['CONNECTING','OPEN','CLOSING','CLOSED'][wsClient.readyState]:'NULL',proxy:PROXY_URL?'YES':'NO',sessions:sessions.length,latest:sessions[0]||null,uptime:Math.floor(process.uptime())+'s'}));
-app.get('/',(req,res)=>res.send(`<h2>🎲 TX</h2><p>WS:${wsClient?['CONNECTING','OPEN','CLOSING','CLOSED'][wsClient.readyState]:'NULL'} Sessions:${sessions.length}</p><a href="/api/lichsu">/api/lichsu</a>`));
-app.listen(PORT,()=>{console.log(`🚀 Port ${PORT}`);connectWS();});
+
+app.get('/api/bet', (req, res) => res.json(currentBetData || {}));
+
+app.get('/api/status', (req, res) => res.json({
+  sessions: sessions.length, lastId, pollCount, lastPoll,
+  ws: wsClient ? ['CONNECTING','OPEN','CLOSING','CLOSED'][wsClient.readyState] : 'NULL',
+  currentBet: currentBetData,
+  uptime: Math.floor(process.uptime()) + 's'
+}));
+
+app.get('/', (req, res) => res.send(`
+  <h2>🎲 TX Collector</h2>
+  <p>Sessions: ${sessions.length} | WS: ${wsClient?['CONNECTING','OPEN','CLOSING','CLOSED'][wsClient.readyState]:'NULL'}</p>
+  <a href="/api/lichsu">/api/lichsu</a> | 
+  <a href="/api/bet">/api/bet</a> | 
+  <a href="/api/status">/api/status</a>
+`));
+
+// Start
+app.listen(PORT, () => {
+  console.log(`🚀 Port ${PORT}`);
+  poll();
+  setInterval(poll, POLL_INTERVAL);
+  connectWS();
+});
