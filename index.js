@@ -2,7 +2,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const net = require('net');
 const tls = require('tls');
-const http = require('http');
+const https = require('https');
 const { URL } = require('url');
 
 const app = express();
@@ -16,10 +16,10 @@ let currentSession = null;
 let wsClient = null;
 let reconnectTimer = null;
 
-// Proxy agent kế thừa http.Agent
-class ProxyAgent extends http.Agent {
+// Proxy agent kế thừa https.Agent (wss cần https)
+class ProxyAgent extends https.Agent {
   constructor(proxyUrl) {
-    super();
+    super({ rejectUnauthorized: false });
     this.proxy = new URL(proxyUrl);
   }
   createConnection(opts, cb) {
